@@ -1,0 +1,34 @@
+﻿source:
+  type: webcam       # webcam | video
+  webcam_index: 0
+  video_path: ""
+
+detector:
+  backend: ultralytics   # ultralytics | ncnn | tflite
+  model_path: ""         # opcional: si vacÃ­o, ultralytics usa default/pretrained
+  conf_thres: 0.25
+  iou_thres: 0.45
+  classes: ["person"]    # para SAR: persona primero
+
+camera:
+  width: 1280
+  height: 720
+  hfov_deg: 78.0         # aproximado; ajusta luego
+  vfov_deg: 44.0         # aproximado; ajusta luego
+
+pose:
+  provider: simulated
+  height_m: 10.0         # simulado por ahora
+  yaw_deg: 0.0
+  pitch_deg: -30.0
+  roll_deg: 0.0
+
+estimation:
+  method: bbox_size      # bbox_size | ray_plane
+  person_height_m: 1.70  # para Alternativa A
+  ground_plane_z: 0.0    # para Alternativa B (suelo plano)
+
+logging:
+  enabled: true
+  out_dir: runs
+  save_video: false
