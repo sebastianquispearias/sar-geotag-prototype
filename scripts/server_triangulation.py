@@ -51,6 +51,10 @@ MODEL_PATH = str(_root / "yolo11n.pt")
 CONF_THRESHOLD = 0.5
 SERVER_PORT = 5000
 
+# Carpeta para guardar fotos recibidas (fuera del proyecto)
+SAVE_DIR = Path.home() / "SAR_Geotag_Capturas"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Conversión de orientación Android → Cámara
@@ -245,6 +249,25 @@ def capture():
         print(f"  FOV: H={corrected_hfov:.1f}° V={corrected_vfov:.1f}° (raw: H={raw_hfov:.1f}° V={raw_vfov:.1f}°)")
         print(f"  Resolución: {img_w}x{img_h}")
         
+        # --- Guardar foto y JSON en carpeta externa ---
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            photo_save_path = SAVE_DIR / f"foto_{ts}.jpg"
+            json_save_path = SAVE_DIR / f"foto_{ts}.json"
+            image.save(str(photo_save_path), "JPEG", quality=90)
+            meta = {
+                "timestamp": photo_data["timestamp"],
+                "gps": photo_data["gps"],
+                "orientation_raw": {"yaw": raw_yaw, "pitch": raw_pitch, "roll": raw_roll},
+                "orientation_camera": photo_data["orientation"],
+                "camera": photo_data["camera"],
+            }
+            with open(json_save_path, "w") as jf:
+                json.dump(meta, jf, indent=2)
+            print(f"  💾 Guardado: {photo_save_path.name}")
+        except Exception as save_err:
+            print(f"  [WARN] No se pudo guardar: {save_err}")
+        
         # Contar mediciones totales
         total_measurements = sum(len(m) for m in measurements_by_person.values())
         
@@ -294,62 +317,75 @@ def reset():
 
 WINDOW_NAME = "SAR Geotag - Servidor"
 selected_person = "A"  # Persona actualmente seleccionada
+waiting_accept = False  # True cuando mostramos detección esperando [S/N]
+pending_measurement = None  # Medición pendiente de aceptar
 
-def mouse_callback(event: int, x: int, y: int, flags: int, param) -> None:
-    """Callback del mouse para asignar detecciones a personas."""
-    global current_photo, current_detections, measurements_by_person
+
+def auto_assign_detection(photo: dict, detections: list) -> None:
+    """
+    Auto-asigna la primera detección de persona encontrada.
+    Muestra el punto amarillo y espera confirmación con [S].
+    """
+    global waiting_accept, pending_measurement
     
-    if event != cv2.EVENT_LBUTTONDOWN:
+    if not detections:
+        print("[AUTO] No se detectaron personas en esta foto")
         return
     
-    # Capturar referencias locales con el lock para evitar race conditions
-    with lock:
-        photo = current_photo
-        detections = current_detections.copy() if current_detections else []
-    
-    print(f"[DEBUG] Click en ({x}, {y}) - Photo: {photo is not None}, Detections: {len(detections)}")
-    
-    if photo is None or not detections:
-        print(f"[CLICK] Ignorado: foto={photo is not None}, detecciones={len(detections)}")
-        return
-    
-    # Verificar si el click está dentro de alguna detección
-    clicked_detection = None
-    for det in detections:
-        x1, y1, x2, y2 = det.xyxy
-        if x1 <= x <= x2 and y1 <= y <= y2:
-            clicked_detection = det
-            break
-    
-    if clicked_detection is None:
-        print(f"[CLICK] No hay detección en ({x}, {y})")
-        return
-    
-    # Calcular centro del bounding box
-    x1, y1, x2, y2 = clicked_detection.xyxy
+    det = detections[0]
+    x1, y1, x2, y2 = det.xyxy
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
     
-    # Ajustar coordenadas a la imagen original (si fue redimensionada)
     scale = photo.get("scale", 1.0)
-    if scale < 1.0:
-        cx_original = int(cx / scale)
-        cy_original = int(cy / scale)
-    else:
-        cx_original = cx
-        cy_original = cy
+    cx_original = int(cx / scale) if scale < 1.0 else cx
+    cy_original = int(cy / scale) if scale < 1.0 else cy
     
-    # Crear medición
     person_key = f"Persona {selected_person}"
     
-    measurement_data = {
+    pending_measurement = {
         "pixel_x": cx_original,
         "pixel_y": cy_original,
+        "pixel_display": (cx, cy),
         "gps": photo["gps"],
         "orientation": photo["orientation"],
         "camera": photo["camera"],
         "timestamp": photo["timestamp"],
-        "image_b64": photo.get("image_b64", ""),  # Thumbnail para el mapa
+        "image_b64": photo.get("image_b64", ""),
+        "person_key": person_key,
+    }
+    waiting_accept = True
+    
+    count = len(measurements_by_person.get(person_key, []))
+    print(f"\n[AUTO] Persona detectada en ({cx}, {cy})")
+    print(f"  {person_key}: medición {count+1}/2")
+    print(f"  Presiona [S] para aceptar, [N] para rechazar")
+
+
+def accept_measurement() -> None:
+    """Acepta la medición pendiente."""
+    global waiting_accept, pending_measurement
+    
+    if not waiting_accept or pending_measurement is None:
+        return
+    
+    person_key = pending_measurement["person_key"]
+    
+    current_count = len(measurements_by_person.get(person_key, []))
+    if current_count >= 2:
+        print(f"[WARN] {person_key} ya tiene 2 mediciones. Presiona [R] para reiniciar.")
+        waiting_accept = False
+        pending_measurement = None
+        return
+    
+    measurement_data = {
+        "pixel_x": pending_measurement["pixel_x"],
+        "pixel_y": pending_measurement["pixel_y"],
+        "gps": pending_measurement["gps"],
+        "orientation": pending_measurement["orientation"],
+        "camera": pending_measurement["camera"],
+        "timestamp": pending_measurement["timestamp"],
+        "image_b64": pending_measurement["image_b64"],
     }
     
     with lock:
@@ -358,13 +394,58 @@ def mouse_callback(event: int, x: int, y: int, flags: int, param) -> None:
         measurements_by_person[person_key].append(measurement_data)
     
     count = len(measurements_by_person[person_key])
-    print(f"\n[ASIGNADO] {person_key} - Medición #{count}")
-    print(f"  Pixel: ({cx_original}, {cy_original})")
-    print(f"  GPS: {photo['gps']['latitude']:.6f}, {photo['gps']['longitude']:.6f}")
+    print(f"\n✅ [ACEPTADO] {person_key} - Medición #{count}")
+    print(f"  Pixel: ({measurement_data['pixel_x']}, {measurement_data['pixel_y']})")
+    print(f"  GPS: {measurement_data['gps']['latitude']:.6f}, {measurement_data['gps']['longitude']:.6f}")
     
-    # Si ya hay 2 mediciones, calcular triangulación
-    if count >= 2:
+    waiting_accept = False
+    pending_measurement = None
+    
+    if count == 1:
+        print(f"\n📷 Ahora envía la FOTO 2 desde otra posición")
+    elif count >= 2:
         do_triangulation(person_key)
+
+
+def reject_measurement() -> None:
+    """Rechaza la medición pendiente."""
+    global waiting_accept, pending_measurement
+    waiting_accept = False
+    pending_measurement = None
+    print("❌ [RECHAZADO] Medición descartada. Envía otra foto.")
+
+
+def mouse_callback(event: int, x: int, y: int, flags: int, param) -> None:
+    """Callback del mouse - click manual en detección si no hay auto-detección."""
+    global current_photo, current_detections, measurements_by_person
+    
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    
+    if waiting_accept:
+        print("[INFO] Presiona [S] para aceptar o [N] para rechazar")
+        return
+    
+    with lock:
+        photo = current_photo
+        detections = current_detections.copy() if current_detections else []
+    
+    if photo is None or not detections:
+        return
+    
+    person_key = f"Persona {selected_person}"
+    current_count = len(measurements_by_person.get(person_key, []))
+    if current_count >= 2:
+        print(f"[WARN] {person_key} ya tiene 2 mediciones. Presiona [R] para reiniciar.")
+        return
+    
+    for det in detections:
+        x1, y1, x2, y2 = det.xyxy
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            auto_assign_detection(photo, [det])
+            return
+    
+    print(f"[CLICK] No hay persona en ({x}, {y})")
 
 
 def do_triangulation(person_key: str) -> None:
@@ -466,73 +547,89 @@ def draw_ui(frame: np.ndarray) -> np.ndarray:
     # Dibujar detecciones YOLO
     for det in current_detections:
         x1, y1, x2, y2 = det.xyxy
-        
-        # Bounding box verde
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Etiqueta
         label = f"Persona {det.conf:.0%}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 255, 0), -1)
         cv2.putText(frame, label, (x1 + 2, y1 - 4), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-        
-        # Centro
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
+        cv2.circle(frame, (cx, cy), 6, (0, 255, 255), -1)
+        cv2.circle(frame, (cx, cy), 8, (255, 255, 255), 2)
+    
+    # Punto de medición pendiente (anillo rojo grande)
+    if waiting_accept and pending_measurement:
+        px, py = pending_measurement["pixel_display"]
+        cv2.circle(frame, (px, py), 14, (0, 0, 255), 3)
+        cv2.circle(frame, (px, py), 6, (0, 255, 255), -1)
     
     # Panel superior
-    cv2.rectangle(frame, (0, 0), (w, 80), (0, 0, 0), -1)
-    cv2.putText(frame, "SAR Geotag - Servidor", (10, 30),
+    cv2.rectangle(frame, (0, 0), (w, 85), (0, 0, 0), -1)
+    cv2.putText(frame, "SAR Geotag - Servidor", (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (76, 175, 80), 2)
-    cv2.putText(frame, f"Persona seleccionada: {selected_person} | "
-                f"[A-Z] cambiar | [R] reset | [Q] salir", (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
-    # Panel lateral derecho - mediciones por persona
-    y_offset = 100
-    cv2.rectangle(frame, (w - 200, y_offset - 10), (w, y_offset + 150), (40, 40, 40), -1)
-    cv2.putText(frame, "Mediciones:", (w - 190, y_offset + 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    person_key = f"Persona {selected_person}"
+    count = len(measurements_by_person.get(person_key, []))
     
-    y_offset += 35
-    for person, meas in measurements_by_person.items():
-        color = (0, 255, 0) if len(meas) >= 2 else (255, 255, 0)
-        text = f"{person}: {len(meas)}/2"
-        if person == f"Persona {selected_person}":
-            text = f"> {text}"
-        cv2.putText(frame, text, (w - 190, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        y_offset += 25
+    if waiting_accept:
+        cv2.putText(frame, f"Persona {selected_person} | [S] Aceptar  [N] Rechazar",
+                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, f"Medicion {count+1}/2 pendiente de confirmar",
+                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
+    else:
+        cv2.putText(frame, f"Persona: {selected_person} ({count}/2) | "
+                    f"[A-Z] cambiar | [F] adjuntar | [R] reset | [Q] salir", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        if count == 0:
+            cv2.putText(frame, "Esperando FOTO 1...",
+                        (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
+        elif count == 1:
+            cv2.putText(frame, "Foto 1 OK. Esperando FOTO 2 desde otra posicion...",
+                        (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
+        elif count >= 2:
+            cv2.putText(frame, "Triangulacion completada",
+                        (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
     
-    # Panel lateral izquierdo - RESULTADOS DE TRIANGULACIÓN
+    # Panel lateral derecho - mediciones (semitransparente)
+    if measurements_by_person:
+        overlay = frame.copy()
+        panel_h = 30 + len(measurements_by_person) * 25
+        cv2.rectangle(overlay, (w - 200, 90), (w, 90 + panel_h), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, "Mediciones:", (w - 190, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_offset = 135
+        for person, meas in measurements_by_person.items():
+            color = (0, 255, 0) if len(meas) >= 2 else (255, 255, 0)
+            text = f"{person}: {len(meas)}/2"
+            if person == person_key:
+                text = f"> {text}"
+            cv2.putText(frame, text, (w - 190, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            y_offset += 25
+    
+    # Panel lateral izquierdo - RESULTADOS
     if triangulation_results:
+        overlay = frame.copy()
         panel_h = 50 + len(triangulation_results) * 110
-        cv2.rectangle(frame, (0, 100), (300, 100 + panel_h), (30, 30, 30), -1)
+        cv2.rectangle(overlay, (0, 100), (300, 100 + panel_h), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         cv2.putText(frame, "RESULTADOS:", (10, 125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
         y_pos = 155
         for person, result in triangulation_results.items():
-            # Nombre de persona
             cv2.putText(frame, f"{person}:", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             y_pos += 22
-            
-            # Distancias individuales
             cv2.putText(frame, f"  Dist cam1: {result['dist1']:.2f} m", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
             y_pos += 18
             cv2.putText(frame, f"  Dist cam2: {result['dist2']:.2f} m", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
             y_pos += 18
-            
-            # Error de rayos
             cv2.putText(frame, f"  Error: {result['ray_error']:.4f} m", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
             y_pos += 20
-            
-            # Coordenadas
             cv2.putText(frame, f"  Lat: {result['lat']:.7f}", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
             y_pos += 16
@@ -540,21 +637,25 @@ def draw_ui(frame: np.ndarray) -> np.ndarray:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
             y_pos += 25
     
-    # Instrucciones
-    if not current_detections:
-        cv2.putText(frame, "Esperando foto del celular...", 
-                    (w // 2 - 150, h // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
-    else:
-        cv2.putText(frame, "Click en una persona para asignar medicion", 
-                    (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+    # Instrucción central
+    if not current_detections and not waiting_accept:
+        cv2.putText(frame, "Esperando foto del celular... [F] para adjuntar desde PC", 
+                    (w // 2 - 250, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+    
+    # Carpeta de guardado
+    cv2.putText(frame, f"Guardando en: {SAVE_DIR}", (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
     
     return frame
 
 def process_pending_photo() -> bool:
     """Procesa la siguiente foto pendiente. Retorna True si había foto."""
     global pending_photos, current_photo, current_detections, detector
+    
+    # No procesar si hay medición esperando aceptar
+    if waiting_accept:
+        return False
     
     with lock:
         if not pending_photos:
@@ -563,11 +664,9 @@ def process_pending_photo() -> bool:
     
     image = photo["image"]
     
-    # Redimensionar imagen para que quepa en pantalla (máximo 900px de alto, 1100px de ancho)
     h, w = image.shape[:2]
     max_width = 1100
     max_height = 700
-    
     scale_w = max_width / w if w > max_width else 1.0
     scale_h = max_height / h if h > max_height else 1.0
     scale = min(scale_w, scale_h)
@@ -577,35 +676,103 @@ def process_pending_photo() -> bool:
         new_h = int(h * scale)
         image = cv2.resize(image, (new_w, new_h))
         photo["image"] = image
-        photo["scale"] = scale  # Guardar escala para ajustar coordenadas
+        photo["scale"] = scale
         print(f"[RESIZE] Imagen redimensionada de {w}x{h} a {new_w}x{new_h} (escala: {scale:.2f})")
     else:
         photo["scale"] = 1.0
     
-    # Ejecutar YOLO en la imagen redimensionada
     if detector is not None:
         detections = detector.detect(image)
-        # Filtrar solo personas (clase "person")
         new_detections = [d for d in detections if d.cls_name == "person"]
         print(f"[YOLO] Detectadas {len(new_detections)} personas")
     else:
         new_detections = []
     
-    # Actualizar de forma atómica
     with lock:
         current_photo = photo
         current_detections = new_detections
     
-    # Traer ventana al frente
-    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
-    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
+    try:
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
+    except Exception:
+        pass
+    
+    # Auto-asignar primera detección
+    if new_detections:
+        auto_assign_detection(photo, new_detections)
     
     return True
 
 
+def load_photo_from_file() -> None:
+    """Abre un diálogo de Windows para adjuntar una foto desde el PC."""
+    global pending_photos
+    
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        
+        file_path = filedialog.askopenfilename(
+            title="Seleccionar foto",
+            filetypes=[("Imágenes", "*.jpg *.jpeg *.png *.bmp"), ("Todos", "*.*")],
+        )
+        root.destroy()
+        
+        if not file_path:
+            print("[FILE] Cancelado")
+            return
+        
+        json_path = Path(file_path).with_suffix(".json")
+        
+        image = Image.open(file_path)
+        image_np = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Crear thumbnail
+        thumb = image.copy()
+        thumb.thumbnail((200, 150))
+        buf = BytesIO()
+        thumb.save(buf, format='JPEG', quality=70)
+        thumb_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        if json_path.exists():
+            with open(json_path) as jf:
+                meta = json.load(jf)
+            photo_data = {
+                "image": image_np,
+                "image_b64": thumb_b64,
+                "timestamp": meta.get("timestamp", datetime.now().isoformat()),
+                "gps": meta.get("gps", {"latitude": 0, "longitude": 0, "altitude": 0, "accuracy": 0}),
+                "orientation": meta.get("orientation_camera", meta.get("orientation", {"yaw": 0, "pitch": 0, "roll": 0})),
+                "camera": meta.get("camera", {"hfov": 67, "vfov": 52, "width": image_np.shape[1], "height": image_np.shape[0]}),
+            }
+            print(f"[FILE] Cargada: {Path(file_path).name} + {json_path.name}")
+        else:
+            photo_data = {
+                "image": image_np,
+                "image_b64": thumb_b64,
+                "timestamp": datetime.now().isoformat(),
+                "gps": {"latitude": 0, "longitude": 0, "altitude": 0, "accuracy": 0},
+                "orientation": {"yaw": 0, "pitch": 0, "roll": 0},
+                "camera": {"hfov": 67, "vfov": 52, "width": image_np.shape[1], "height": image_np.shape[0]},
+            }
+            print(f"[FILE] Cargada: {Path(file_path).name} (sin JSON de metadatos)")
+            print(f"  [WARN] Sin GPS/orientación - los resultados no serán precisos")
+        
+        with lock:
+            pending_photos.append(photo_data)
+        
+    except Exception as e:
+        print(f"[ERROR] Al cargar foto: {e}")
+
+
 def run_opencv_ui():
     """Loop principal de la interfaz OpenCV."""
-    global selected_person, detector
+    global selected_person, detector, waiting_accept, pending_measurement
     
     # Cargar detector YOLO
     print(f"[YOLO] Cargando modelo: {MODEL_PATH}")
@@ -622,47 +789,56 @@ def run_opencv_ui():
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
     
-    # Frame negro inicial
     blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     
-    print("\n" + "="*60)
-    print("  SERVIDOR INICIADO")
+    print(f"\n{'='*60}")
+    print(f"  SERVIDOR INICIADO")
     print(f"  Escuchando en: http://0.0.0.0:{SERVER_PORT}")
-    print("="*60)
-    print("\nCONTROLES:")
-    print("  [A-Z]   = Seleccionar persona")
-    print("  [Click] = Asignar detección a persona seleccionada")
-    print("  [R]     = Reiniciar mediciones")
-    print("  [Q]     = Salir")
+    print(f"  Fotos guardadas en: {SAVE_DIR}")
+    print(f"{'='*60}")
+    print(f"\nCONTROLES:")
+    print(f"  [A-Z]   = Seleccionar persona")
+    print(f"  [S]     = Aceptar medición")
+    print(f"  [N]     = Rechazar medición")
+    print(f"  [F]     = Adjuntar foto desde PC")
+    print(f"  [R]     = Reiniciar mediciones")
+    print(f"  [Q]     = Salir")
     print("-"*60 + "\n")
     
     while True:
-        # Procesar foto pendiente
         process_pending_photo()
         
-        # Mostrar frame actual o blank
         if current_photo is not None:
             frame = current_photo["image"].copy()
         else:
             frame = blank_frame.copy()
         
-        # Dibujar UI
         frame = draw_ui(frame)
-        
         cv2.imshow(WINDOW_NAME, frame)
-        key = cv2.waitKey(30) & 0xFF  # Reducido a 30ms para mejor respuesta
+        key = cv2.waitKey(30) & 0xFF
         
         if key == ord('q') or key == ord('Q'):
             break
+        elif key == ord('s') or key == ord('S'):
+            if waiting_accept:
+                accept_measurement()
+        elif key == ord('n') or key == ord('N'):
+            if waiting_accept:
+                reject_measurement()
+        elif key == ord('f') or key == ord('F'):
+            if not waiting_accept:
+                load_photo_from_file()
         elif key == ord('r') or key == ord('R'):
-            with lock:
-                measurements_by_person.clear()
-                pending_photos.clear()
-                triangulation_results.clear()
-            print("[RESET] Mediciones reiniciadas")
+            if not waiting_accept:
+                with lock:
+                    measurements_by_person.clear()
+                    pending_photos.clear()
+                    triangulation_results.clear()
+                print("[RESET] Mediciones reiniciadas")
         elif ord('a') <= key <= ord('z') or ord('A') <= key <= ord('Z'):
-            selected_person = chr(key).upper()
-            print(f"[SELECT] Persona {selected_person}")
+            if not waiting_accept:
+                selected_person = chr(key).upper()
+                print(f"[SELECT] Persona {selected_person}")
     
     cv2.destroyAllWindows()
 
