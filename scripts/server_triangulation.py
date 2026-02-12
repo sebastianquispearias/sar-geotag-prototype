@@ -1,0 +1,590 @@
+"""
+SAR Geotag - Servidor para recibir fotos del celular Android.
+
+Recibe fotos con metadatos GPS/orientación via HTTP POST,
+ejecuta YOLO para detectar personas, y permite al operador
+hacer click para asignar mediciones.
+
+Cuando se tienen 2 mediciones de la misma persona, ejecuta
+Ray Intersection para calcular la posición.
+
+Uso:
+    python scripts/server_triangulation.py
+
+El servidor escucha en http://0.0.0.0:5000
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Agregar el directorio raíz al path para imports
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
+import base64
+import json
+import threading
+from datetime import datetime
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+from src.vision.ultralytics_detector import UltralyticsDetector
+from src.geometry.pinhole import create_measurement, Measurement
+from src.geometry.geolocalization import geolocalize_from_measurements
+from src.geo.map_viewer import show_triangulation_map
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuración
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MODEL_PATH = str(_root / "yolo11n.pt")
+CONF_THRESHOLD = 0.5
+SERVER_PORT = 5000
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Estado global
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Diccionario de mediciones por persona: {"Persona A": [Measurement, ...], ...}
+measurements_by_person: Dict[str, List[dict]] = {}
+
+# Cola de fotos pendientes para procesar
+pending_photos: List[dict] = []
+
+# Foto actual mostrada en OpenCV
+current_photo: Optional[dict] = None
+current_detections: List = []
+
+# Resultados de triangulación por persona
+triangulation_results: Dict[str, dict] = {}  # {"Persona A": {"lat": ..., "lon": ..., "dist1": ..., ...}}
+
+# Lock para thread safety
+lock = threading.Lock()
+
+# Detector YOLO
+detector: Optional[UltralyticsDetector] = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flask App
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+CORS(app)
+
+
+@app.route("/capture", methods=["POST"])
+def capture():
+    """
+    Endpoint para recibir fotos del celular Android.
+    
+    Espera JSON con:
+    - image: string base64 de la imagen JPEG
+    - timestamp: ISO 8601
+    - gps: {latitude, longitude, altitude, accuracy}
+    - orientation: {yaw, pitch, roll}
+    - camera: {hfov, vfov, width, height}
+    """
+    global pending_photos
+    
+    try:
+        data = request.get_json()
+        
+        if not data or "image" not in data:
+            return jsonify({"error": "No image data"}), 400
+        
+        # Decodificar imagen
+        image_b64 = data["image"]
+        image_bytes = base64.b64decode(image_b64)
+        image = Image.open(BytesIO(image_bytes))
+        image_np = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Extraer metadatos
+        gps = data.get("gps", {})
+        orientation = data.get("orientation", {})
+        camera = data.get("camera", {})
+        
+        # Crear thumbnail para mostrar en el mapa
+        thumb_size = (200, 150)
+        image_thumb = image.copy()
+        image_thumb.thumbnail(thumb_size)
+        thumb_buffer = BytesIO()
+        image_thumb.save(thumb_buffer, format='JPEG', quality=70)
+        thumb_b64 = base64.b64encode(thumb_buffer.getvalue()).decode('utf-8')
+        
+        photo_data = {
+            "image": image_np,
+            "image_b64": thumb_b64,  # Thumbnail para el mapa
+            "timestamp": data.get("timestamp", datetime.now().isoformat()),
+            "gps": {
+                "latitude": gps.get("latitude", 0),
+                "longitude": gps.get("longitude", 0),
+                "altitude": gps.get("altitude", 0),
+                "accuracy": gps.get("accuracy", 0),
+            },
+            "orientation": {
+                "yaw": orientation.get("yaw", 0),
+                "pitch": orientation.get("pitch", 0),
+                "roll": orientation.get("roll", 0),
+            },
+            "camera": {
+                "hfov": camera.get("hfov", 67),
+                "vfov": camera.get("vfov", 52),
+                "width": camera.get("width", image_np.shape[1]),
+                "height": camera.get("height", image_np.shape[0]),
+            },
+        }
+        
+        with lock:
+            pending_photos.append(photo_data)
+        
+        print(f"\n[RECIBIDO] Foto de {photo_data['gps']['latitude']:.6f}, "
+              f"{photo_data['gps']['longitude']:.6f}")
+        print(f"  Orientación: Yaw={photo_data['orientation']['yaw']:.1f}°, "
+              f"Pitch={photo_data['orientation']['pitch']:.1f}°")
+        
+        # Contar mediciones totales
+        total_measurements = sum(len(m) for m in measurements_by_person.values())
+        
+        response = {
+            "status": "ok",
+            "message": "Foto recibida, esperando asignación en laptop",
+            "measurement_count": total_measurements,
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """Estado actual del servidor, incluyendo persona seleccionada."""
+    person_key = f"Persona {selected_person}"
+    current_count = len(measurements_by_person.get(person_key, []))
+    
+    return jsonify({
+        "status": "running",
+        "pending_photos": len(pending_photos),
+        "selected_person": selected_person,
+        "measurement_count": current_count,
+        "persons": {k: len(v) for k, v in measurements_by_person.items()},
+    })
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    """Reinicia todas las mediciones."""
+    global measurements_by_person, pending_photos, triangulation_results
+    with lock:
+        measurements_by_person = {}
+        pending_photos = []
+        triangulation_results = {}
+    print("[RESET] Todas las mediciones eliminadas")
+    return jsonify({"status": "ok"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Interfaz OpenCV
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WINDOW_NAME = "SAR Geotag - Servidor"
+selected_person = "A"  # Persona actualmente seleccionada
+
+def mouse_callback(event: int, x: int, y: int, flags: int, param) -> None:
+    """Callback del mouse para asignar detecciones a personas."""
+    global current_photo, current_detections, measurements_by_person
+    
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    
+    # Capturar referencias locales con el lock para evitar race conditions
+    with lock:
+        photo = current_photo
+        detections = current_detections.copy() if current_detections else []
+    
+    print(f"[DEBUG] Click en ({x}, {y}) - Photo: {photo is not None}, Detections: {len(detections)}")
+    
+    if photo is None or not detections:
+        print(f"[CLICK] Ignorado: foto={photo is not None}, detecciones={len(detections)}")
+        return
+    
+    # Verificar si el click está dentro de alguna detección
+    clicked_detection = None
+    for det in detections:
+        x1, y1, x2, y2 = det.xyxy
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            clicked_detection = det
+            break
+    
+    if clicked_detection is None:
+        print(f"[CLICK] No hay detección en ({x}, {y})")
+        return
+    
+    # Calcular centro del bounding box
+    x1, y1, x2, y2 = clicked_detection.xyxy
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    
+    # Ajustar coordenadas a la imagen original (si fue redimensionada)
+    scale = photo.get("scale", 1.0)
+    if scale < 1.0:
+        cx_original = int(cx / scale)
+        cy_original = int(cy / scale)
+    else:
+        cx_original = cx
+        cy_original = cy
+    
+    # Crear medición
+    person_key = f"Persona {selected_person}"
+    
+    measurement_data = {
+        "pixel_x": cx_original,
+        "pixel_y": cy_original,
+        "gps": photo["gps"],
+        "orientation": photo["orientation"],
+        "camera": photo["camera"],
+        "timestamp": photo["timestamp"],
+        "image_b64": photo.get("image_b64", ""),  # Thumbnail para el mapa
+    }
+    
+    with lock:
+        if person_key not in measurements_by_person:
+            measurements_by_person[person_key] = []
+        measurements_by_person[person_key].append(measurement_data)
+    
+    count = len(measurements_by_person[person_key])
+    print(f"\n[ASIGNADO] {person_key} - Medición #{count}")
+    print(f"  Pixel: ({cx_original}, {cy_original})")
+    print(f"  GPS: {photo['gps']['latitude']:.6f}, {photo['gps']['longitude']:.6f}")
+    
+    # Si ya hay 2 mediciones, calcular triangulación
+    if count >= 2:
+        do_triangulation(person_key)
+
+
+def do_triangulation(person_key: str) -> None:
+    """Ejecuta Ray Intersection para una persona."""
+    global measurements_by_person
+    
+    data_list = measurements_by_person[person_key]
+    if len(data_list) < 2:
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"EJECUTANDO RAY INTERSECTION - {person_key}")
+    print(f"{'='*60}")
+    
+    # Crear objetos Measurement
+    measurements = []
+    camera_positions = []
+    camera_images = []  # Thumbnails para el mapa
+    
+    for i, data in enumerate(data_list[:2]):  # Usar las 2 primeras
+        m = create_measurement(
+            camera_lat=data["gps"]["latitude"],
+            camera_lon=data["gps"]["longitude"],
+            camera_alt=data["gps"]["altitude"] + 1.5,  # altura cámara
+            pixel_x=data["pixel_x"],
+            pixel_y=data["pixel_y"],
+            image_width=data["camera"]["width"],
+            image_height=data["camera"]["height"],
+            hfov_deg=data["camera"]["hfov"],
+            vfov_deg=data["camera"]["vfov"],
+            yaw_deg=data["orientation"]["yaw"],
+            pitch_deg=data["orientation"]["pitch"],
+            roll_deg=data["orientation"]["roll"],
+        )
+        measurements.append(m)
+        camera_positions.append((
+            data["gps"]["latitude"],
+            data["gps"]["longitude"],
+            data["gps"]["altitude"] + 1.5,
+        ))
+        camera_images.append(data.get("image_b64", ""))
+        print(f"  Medición {i+1}: GPS=({data['gps']['latitude']:.6f}, "
+              f"{data['gps']['longitude']:.6f}), Yaw={data['orientation']['yaw']:.1f}°")
+    
+    # Ejecutar triangulación
+    result_point, info = geolocalize_from_measurements(measurements)
+    
+    if result_point is None:
+        print(f"\n[ERROR] Triangulación fallida: {info.get('error', 'unknown')}")
+        return
+    
+    # Guardar resultado para mostrar en UI
+    triangulation_results[person_key] = {
+        "lat": result_point.lat_deg,
+        "lon": result_point.lon_deg,
+        "alt": result_point.alt_m,
+        "dist1": info.get("distance_from_cam1_m", 0),
+        "dist2": info.get("distance_from_cam2_m", 0),
+        "ray_error": info.get("ray_distance_m", 0),
+        "algorithm": info.get("algorithm", "ray_intersection"),
+    }
+    
+    print(f"\n🎯 {person_key.upper()} GEOLOCALIZADA:")
+    print(f"   Latitud:  {result_point.lat_deg:.10f}°")
+    print(f"   Longitud: {result_point.lon_deg:.10f}°")
+    print(f"   Altitud:  {result_point.alt_m:.2f} m")
+    
+    if "distance_from_cam1_m" in info:
+        print(f"   Distancia desde cámara 1: {info['distance_from_cam1_m']:.2f} m")
+    if "distance_from_cam2_m" in info:
+        print(f"   Distancia desde cámara 2: {info['distance_from_cam2_m']:.2f} m")
+    if "ray_distance_m" in info:
+        print(f"   Error rayos: {info['ray_distance_m']:.4f} m")
+    
+    print(f"{'='*60}\n")
+    
+    # Mostrar en mapa (con imágenes)
+    show_triangulation_map(
+        object_lat=result_point.lat_deg,
+        object_lon=result_point.lon_deg,
+        object_alt=result_point.alt_m,
+        camera_positions=camera_positions,
+        camera_images=camera_images,
+        info=info,
+        output_dir=str(_root / "runs"),
+    )
+
+
+def draw_ui(frame: np.ndarray) -> np.ndarray:
+    """Dibuja la interfaz sobre el frame."""
+    global current_detections, selected_person, measurements_by_person, triangulation_results
+    
+    h, w = frame.shape[:2]
+    
+    # Dibujar detecciones YOLO
+    for det in current_detections:
+        x1, y1, x2, y2 = det.xyxy
+        
+        # Bounding box verde
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        # Etiqueta
+        label = f"Persona {det.conf:.0%}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 255, 0), -1)
+        cv2.putText(frame, label, (x1 + 2, y1 - 4), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        # Centro
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
+    
+    # Panel superior
+    cv2.rectangle(frame, (0, 0), (w, 80), (0, 0, 0), -1)
+    cv2.putText(frame, "SAR Geotag - Servidor", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (76, 175, 80), 2)
+    cv2.putText(frame, f"Persona seleccionada: {selected_person} | "
+                f"[A-Z] cambiar | [R] reset | [Q] salir", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    # Panel lateral derecho - mediciones por persona
+    y_offset = 100
+    cv2.rectangle(frame, (w - 200, y_offset - 10), (w, y_offset + 150), (40, 40, 40), -1)
+    cv2.putText(frame, "Mediciones:", (w - 190, y_offset + 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    y_offset += 35
+    for person, meas in measurements_by_person.items():
+        color = (0, 255, 0) if len(meas) >= 2 else (255, 255, 0)
+        text = f"{person}: {len(meas)}/2"
+        if person == f"Persona {selected_person}":
+            text = f"> {text}"
+        cv2.putText(frame, text, (w - 190, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        y_offset += 25
+    
+    # Panel lateral izquierdo - RESULTADOS DE TRIANGULACIÓN
+    if triangulation_results:
+        panel_h = 50 + len(triangulation_results) * 110
+        cv2.rectangle(frame, (0, 100), (300, 100 + panel_h), (30, 30, 30), -1)
+        cv2.putText(frame, "RESULTADOS:", (10, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        y_pos = 155
+        for person, result in triangulation_results.items():
+            # Nombre de persona
+            cv2.putText(frame, f"{person}:", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            y_pos += 22
+            
+            # Distancias individuales
+            cv2.putText(frame, f"  Dist cam1: {result['dist1']:.2f} m", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
+            y_pos += 18
+            cv2.putText(frame, f"  Dist cam2: {result['dist2']:.2f} m", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
+            y_pos += 18
+            
+            # Error de rayos
+            cv2.putText(frame, f"  Error: {result['ray_error']:.4f} m", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+            y_pos += 20
+            
+            # Coordenadas
+            cv2.putText(frame, f"  Lat: {result['lat']:.7f}", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+            y_pos += 16
+            cv2.putText(frame, f"  Lon: {result['lon']:.7f}", (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+            y_pos += 25
+    
+    # Instrucciones
+    if not current_detections:
+        cv2.putText(frame, "Esperando foto del celular...", 
+                    (w // 2 - 150, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+    else:
+        cv2.putText(frame, "Click en una persona para asignar medicion", 
+                    (10, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+    
+    return frame
+
+def process_pending_photo() -> bool:
+    """Procesa la siguiente foto pendiente. Retorna True si había foto."""
+    global pending_photos, current_photo, current_detections, detector
+    
+    with lock:
+        if not pending_photos:
+            return False
+        photo = pending_photos.pop(0)
+    
+    image = photo["image"]
+    
+    # Redimensionar imagen para que quepa en pantalla (máximo 900px de alto, 1100px de ancho)
+    h, w = image.shape[:2]
+    max_width = 1100
+    max_height = 700
+    
+    scale_w = max_width / w if w > max_width else 1.0
+    scale_h = max_height / h if h > max_height else 1.0
+    scale = min(scale_w, scale_h)
+    
+    if scale < 1.0:
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image = cv2.resize(image, (new_w, new_h))
+        photo["image"] = image
+        photo["scale"] = scale  # Guardar escala para ajustar coordenadas
+        print(f"[RESIZE] Imagen redimensionada de {w}x{h} a {new_w}x{new_h} (escala: {scale:.2f})")
+    else:
+        photo["scale"] = 1.0
+    
+    # Ejecutar YOLO en la imagen redimensionada
+    if detector is not None:
+        detections = detector.detect(image)
+        # Filtrar solo personas (clase "person")
+        new_detections = [d for d in detections if d.cls_name == "person"]
+        print(f"[YOLO] Detectadas {len(new_detections)} personas")
+    else:
+        new_detections = []
+    
+    # Actualizar de forma atómica
+    with lock:
+        current_photo = photo
+        current_detections = new_detections
+    
+    # Traer ventana al frente
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
+    
+    return True
+
+
+def run_opencv_ui():
+    """Loop principal de la interfaz OpenCV."""
+    global selected_person, detector
+    
+    # Cargar detector YOLO
+    print(f"[YOLO] Cargando modelo: {MODEL_PATH}")
+    try:
+        detector = UltralyticsDetector(
+            model_name=MODEL_PATH,
+            conf=CONF_THRESHOLD,
+        )
+        print("[YOLO] Modelo cargado correctamente")
+    except Exception as e:
+        print(f"[ERROR] No se pudo cargar YOLO: {e}")
+        detector = None
+    
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
+    
+    # Frame negro inicial
+    blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    
+    print("\n" + "="*60)
+    print("  SERVIDOR INICIADO")
+    print(f"  Escuchando en: http://0.0.0.0:{SERVER_PORT}")
+    print("="*60)
+    print("\nCONTROLES:")
+    print("  [A-Z]   = Seleccionar persona")
+    print("  [Click] = Asignar detección a persona seleccionada")
+    print("  [R]     = Reiniciar mediciones")
+    print("  [Q]     = Salir")
+    print("-"*60 + "\n")
+    
+    while True:
+        # Procesar foto pendiente
+        process_pending_photo()
+        
+        # Mostrar frame actual o blank
+        if current_photo is not None:
+            frame = current_photo["image"].copy()
+        else:
+            frame = blank_frame.copy()
+        
+        # Dibujar UI
+        frame = draw_ui(frame)
+        
+        cv2.imshow(WINDOW_NAME, frame)
+        key = cv2.waitKey(30) & 0xFF  # Reducido a 30ms para mejor respuesta
+        
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif key == ord('r') or key == ord('R'):
+            with lock:
+                measurements_by_person.clear()
+                pending_photos.clear()
+                triangulation_results.clear()
+            print("[RESET] Mediciones reiniciadas")
+        elif ord('a') <= key <= ord('z') or ord('A') <= key <= ord('Z'):
+            selected_person = chr(key).upper()
+            print(f"[SELECT] Persona {selected_person}")
+    
+    cv2.destroyAllWindows()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    # Iniciar Flask en un thread separado
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=SERVER_PORT, threaded=True),
+        daemon=True
+    )
+    flask_thread.start()
+    
+    # Ejecutar UI de OpenCV en el thread principal
+    run_opencv_ui()
+
+
+if __name__ == "__main__":
+    main()
