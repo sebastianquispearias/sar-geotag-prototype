@@ -450,13 +450,13 @@ def show_triangulation_map(
     </div>
     
     <script>
-        var map = L.map('map').setView([{center_lat}, {center_lon}], 19);
+        var map = L.map('map', {{maxZoom: 22}}).setView([{center_lat}, {center_lon}], 20);
         
         var cartoDB = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}@2x.png', {{
-            maxZoom: 20, subdomains: 'abcd'
+            maxZoom: 22, maxNativeZoom: 20, subdomains: 'abcd'
         }}).addTo(map);
-        var cartoLight = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}@2x.png', {{ maxZoom: 20, subdomains: 'abcd' }});
-        var esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ maxZoom: 19 }});
+        var cartoLight = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}@2x.png', {{ maxZoom: 22, maxNativeZoom: 20, subdomains: 'abcd' }});
+        var esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ maxZoom: 22, maxNativeZoom: 19 }});
         L.control.layers({{ "🌙 Oscuro": cartoDB, "☀️ Claro": cartoLight, "🛰️ Satélite": esriSat }}).addTo(map);
         
         var layers = {{ target: L.layerGroup(), cam1: L.layerGroup(), cam2: L.layerGroup(), lines: L.layerGroup() }};
@@ -515,7 +515,7 @@ def show_triangulation_map(
         }}
         
         var bounds = L.latLngBounds([[{object_lat}, {object_lon}], {"".join(f"[{c[0]}, {c[1]}]," for c in camera_positions)}]);
-        map.fitBounds(bounds, {{ padding: [60, 60], maxZoom: 19 }});
+        map.fitBounds(bounds, {{ padding: [80, 80], maxZoom: 21 }});
     </script>
 </body>
 </html>"""
