@@ -5,7 +5,7 @@
 
 detector:
   backend: ultralytics   # ultralytics | ncnn | tflite
-  model_path: ""         # opcional: si vacÃ­o, ultralytics usa default/pretrained
+  model_path: ""         # opcional: si vacío, ultralytics usa default/pretrained
   conf_thres: 0.25
   iou_thres: 0.45
   classes: ["person"]    # para SAR: persona primero
@@ -17,11 +17,18 @@ camera:
   vfov_deg: 44.0         # aproximado; ajusta luego
 
 pose:
-  provider: simulated
-  height_m: 10.0         # simulado por ahora
-  yaw_deg: 0.0
-  pitch_deg: -30.0
-  roll_deg: 0.0
+  provider: simulated    # simulated | telemetry (futuro)
+  # Nota: altura, pitch, roll y yaw ahora se configuran en la sección 'gps'
+  #       al inicio del programa mediante el diálogo de configuración.
+
+gps:
+  lat: 0.0               # latitud de la cámara (grados)
+  lon: 0.0               # longitud de la cámara (grados)
+  altitude_m: 0.0        # altitud sobre nivel del mar (metros)
+  height_m: 1.5          # altura de la cámara sobre el suelo (metros)
+  yaw_deg: 0.0           # heading/orientación (0=Norte, 90=Este)
+  pitch_deg: 0.0         # inclinación (0=horizontal, negativo=abajo)
+  roll_deg: 0.0          # alabeo (0=nivelado)
 
 estimation:
   method: bbox_size      # bbox_size | ray_plane
