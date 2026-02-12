@@ -51,6 +51,73 @@ MODEL_PATH = str(_root / "yolo11n.pt")
 CONF_THRESHOLD = 0.5
 SERVER_PORT = 5000
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Conversión de orientación Android → Cámara
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def convert_android_orientation(yaw_deg: float, pitch_deg: float, roll_deg: float,
+                                 img_width: int, img_height: int) -> dict:
+    """
+    Convierte orientación del sensor Android a orientación de la cámara.
+    
+    Problema: Android SensorManager.getOrientation() devuelve la orientación
+    del DISPOSITIVO, no de la cámara:
+    
+    - Cuando sostienes el teléfono vertical (tomando foto normal):
+      Android reporta pitch ≈ -90° (dispositivo vertical)
+      Pero la cámara mira HORIZONTAL → camera pitch ≈ 0°
+    
+    - Cuando el teléfono está plano (pantalla arriba):
+      Android reporta pitch ≈ 0° (dispositivo horizontal)
+      Pero la cámara mira ARRIBA → camera pitch ≈ 90°
+    
+    Conversión: camera_pitch = -(device_pitch + 90°)
+    
+    También detecta si la foto es portrait (height > width) para
+    intercambiar HFOV/VFOV.
+    """
+    is_portrait = img_height > img_width
+    
+    # --- Convertir Pitch ---
+    # Android pitch: 0=plano, -90=vertical apuntando arriba
+    # Camera pitch: 0=horizontal, negativo=mirando abajo
+    camera_pitch = -(pitch_deg + 90.0)
+    
+    # --- Convertir Roll ---
+    # En portrait, roll necesita ajuste
+    camera_roll = roll_deg
+    if is_portrait:
+        # Normalizar roll a -180..180
+        if camera_roll > 90:
+            camera_roll = camera_roll - 180.0
+        elif camera_roll < -90:
+            camera_roll = camera_roll + 180.0
+    
+    # --- Yaw se mantiene igual (0=Norte, 90=Este) ---
+    camera_yaw = yaw_deg
+    
+    return {
+        "yaw": camera_yaw,
+        "pitch": camera_pitch,
+        "roll": camera_roll,
+        "is_portrait": is_portrait,
+    }
+
+
+def get_camera_fov(hfov: float, vfov: float, img_width: int, img_height: int) -> tuple:
+    """
+    Devuelve el FOV correcto según la orientación de la imagen.
+    
+    Los FOV hardcodeados (67°/52°) son para LANDSCAPE.
+    En PORTRAIT (height > width) se intercambian.
+    """
+    if img_height > img_width:
+        # Portrait: el ancho de la imagen corresponde al lado corto del sensor
+        return vfov, hfov  # intercambiar
+    return hfov, vfov
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Estado global
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +188,24 @@ def capture():
         image_thumb.save(thumb_buffer, format='JPEG', quality=70)
         thumb_b64 = base64.b64encode(thumb_buffer.getvalue()).decode('utf-8')
         
+        # --- Obtener dimensiones de imagen ---
+        img_w = camera.get("width", image_np.shape[1])
+        img_h = camera.get("height", image_np.shape[0])
+        
+        # --- Convertir orientación Android → Cámara ---
+        raw_yaw = orientation.get("yaw", 0)
+        raw_pitch = orientation.get("pitch", 0)
+        raw_roll = orientation.get("roll", 0)
+        
+        cam_orient = convert_android_orientation(
+            raw_yaw, raw_pitch, raw_roll, img_w, img_h
+        )
+        
+        # --- Corregir FOV para portrait/landscape ---
+        raw_hfov = camera.get("hfov", 67)
+        raw_vfov = camera.get("vfov", 52)
+        corrected_hfov, corrected_vfov = get_camera_fov(raw_hfov, raw_vfov, img_w, img_h)
+        
         photo_data = {
             "image": image_np,
             "image_b64": thumb_b64,  # Thumbnail para el mapa
@@ -132,25 +217,33 @@ def capture():
                 "accuracy": gps.get("accuracy", 0),
             },
             "orientation": {
-                "yaw": orientation.get("yaw", 0),
-                "pitch": orientation.get("pitch", 0),
-                "roll": orientation.get("roll", 0),
+                "yaw": cam_orient["yaw"],
+                "pitch": cam_orient["pitch"],
+                "roll": cam_orient["roll"],
             },
             "camera": {
-                "hfov": camera.get("hfov", 67),
-                "vfov": camera.get("vfov", 52),
-                "width": camera.get("width", image_np.shape[1]),
-                "height": camera.get("height", image_np.shape[0]),
+                "hfov": corrected_hfov,
+                "vfov": corrected_vfov,
+                "width": img_w,
+                "height": img_h,
             },
         }
         
         with lock:
             pending_photos.append(photo_data)
         
-        print(f"\n[RECIBIDO] Foto de {photo_data['gps']['latitude']:.6f}, "
-              f"{photo_data['gps']['longitude']:.6f}")
-        print(f"  Orientación: Yaw={photo_data['orientation']['yaw']:.1f}°, "
-              f"Pitch={photo_data['orientation']['pitch']:.1f}°")
+        print(f"\n{'='*60}")
+        print(f"[RECIBIDO] FOTO #{len(pending_photos)}")
+        print(f"{'='*60}")
+        print(f"  GPS: ({photo_data['gps']['latitude']:.6f}, {photo_data['gps']['longitude']:.6f})")
+        print(f"  Altitud: {photo_data['gps']['altitude']:.1f} m, Precisión: {photo_data['gps']['accuracy']:.1f} m")
+        print(f"  Orientación ANDROID (raw):")
+        print(f"    YAW={raw_yaw:.1f}°  PITCH={raw_pitch:.1f}°  ROLL={raw_roll:.1f}°")
+        print(f"  Orientación CÁMARA (corregida):")
+        print(f"    YAW={cam_orient['yaw']:.1f}°  PITCH={cam_orient['pitch']:.1f}°  ROLL={cam_orient['roll']:.1f}°")
+        print(f"  {'📱 PORTRAIT' if cam_orient['is_portrait'] else '🖥️ LANDSCAPE'}")
+        print(f"  FOV: H={corrected_hfov:.1f}° V={corrected_vfov:.1f}° (raw: H={raw_hfov:.1f}° V={raw_vfov:.1f}°)")
+        print(f"  Resolución: {img_w}x{img_h}")
         
         # Contar mediciones totales
         total_measurements = sum(len(m) for m in measurements_by_person.values())
@@ -313,8 +406,12 @@ def do_triangulation(person_key: str) -> None:
             data["gps"]["altitude"] + 1.5,
         ))
         camera_images.append(data.get("image_b64", ""))
-        print(f"  Medición {i+1}: GPS=({data['gps']['latitude']:.6f}, "
-              f"{data['gps']['longitude']:.6f}), Yaw={data['orientation']['yaw']:.1f}°")
+        print(f"\n  📷 Medición {i+1}:")
+        print(f"     GPS: ({data['gps']['latitude']:.6f}, {data['gps']['longitude']:.6f})")
+        print(f"     Pixel click: ({data['pixel_x']}, {data['pixel_y']}) en imagen {data['camera']['width']}x{data['camera']['height']}")
+        print(f"     FOV: H={data['camera']['hfov']:.1f}°, V={data['camera']['vfov']:.1f}°")
+        print(f"     YAW={data['orientation']['yaw']:.1f}°, PITCH={data['orientation']['pitch']:.1f}°")
+        print(f"     Vector dirección ECEF: [{m.direction[0]:.4f}, {m.direction[1]:.4f}, {m.direction[2]:.4f}]")
     
     # Ejecutar triangulación
     result_point, info = geolocalize_from_measurements(measurements)
